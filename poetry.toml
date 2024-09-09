@@ -1,0 +1,2 @@
+[installer]
+no-binary = ["scikit-surprise", "lightfm", "recommenders"]

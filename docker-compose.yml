@@ -1,0 +1,8 @@
+# Copyright (c) 2024, ZDF.
+services:
+  asd:
+    platform: linux/amd64
+    image: sasrec
+    environment:
+      SAGEMAKER_PROGRAM: serve
+      SITE: prod

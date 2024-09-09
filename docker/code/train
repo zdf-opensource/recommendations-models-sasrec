@@ -1,0 +1,158 @@
+# Copyright (c) 2024, ZDF.
+#!/usr/bin/env python
+# This is a an entrypoint script for SageMaker training jobs.
+# It launches the individual training job based upon hyperparameter settings.
+#
+
+import os
+import sys
+import logging
+from pathlib import Path
+
+import pandas as pd
+from hyperparams import Hyperparams,load_hyperparams
+
+
+# This algorithm has a single channel of input data called 'training'. Since we run in
+# File mode, any input files are copied to the directory specified here.
+SM_CHANNEL_NAME = "training"
+
+# default SageMaker container prefix
+SM_PATH_PREFIX = '/opt/ml/'
+
+SITE, HP = load_hyperparams(SM_PATH_PREFIX=SM_PATH_PREFIX)
+
+#import which depend on pa-base after loading hyperparams, because else SITE not set when starting hyperparameter tuning jobs  with start_hyperparmeter_tuning
+
+from sasrec_common import preprocess, train_model, prepare_data_for_training, dump_meta_data_model, data_split, offline_evaluation
+from pa_base.logging import reconfigure_logging
+from pa_base.train.cloud_watch_metrics import CloudWatchMetrics
+
+
+
+
+def main(
+    *,
+    site: str,
+    hyperparams: Hyperparams,
+):
+    # log to CloudWatch Metrics
+    cw_metrics = CloudWatchMetrics(model_name=hyperparams.model_variant_name, enabled=hyperparams.log_cloud_watch)
+
+    # CREATE INPUT DIR
+    # this is the path were sagemaker injects processing inputs into the container
+    input_dir = os.path.join(SM_PATH_PREFIX, 'input')
+    logging.info(f"'{input_dir}' now contains: '{os.listdir(input_dir)}'.")
+    data_input_dir = os.path.join(SM_PATH_PREFIX, 'input/data')
+    logging.info(f"'{data_input_dir}' now contains: '{os.listdir(data_input_dir)}'.")
+    preprocessed_input_dir = os.path.join(SM_PATH_PREFIX, 'input/data/preprocessed')
+
+
+    # CREATE OUTPUT DIR
+    # this is the path where sagemaker injects the model into the container
+    model_dir = os.path.join(SM_PATH_PREFIX, 'model')
+    # create output path from which final model.tar.gz will be created
+    # pathlib.Path(model_path).mkdir(parents=True, exist_ok=True)
+    os.makedirs(model_dir, exist_ok=True)
+
+    #Read the data from parquet file if it already exists on the disk
+    if os.path.exists(preprocessed_input_dir) and os.path.exists(os.path.join(preprocessed_input_dir, "data.parquet")):
+        logging.info(f"'{preprocessed_input_dir}' now contains: '{os.listdir(preprocessed_input_dir)}'.")
+        # USE PREPROCESSED DATA
+        # use processing input
+        data = pd.read_parquet(path=os.path.join(preprocessed_input_dir, "data.parquet"))
+    else:
+        # PREPROCESS DATA
+        #create preprocessed_input_dir if it does not exist
+        Path(preprocessed_input_dir).mkdir(parents=True, exist_ok=True)
+        logging.info(f"'{preprocessed_input_dir}' now contains: '{os.listdir(preprocessed_input_dir)}'.")
+        data = preprocess(site=site, hyperparams=hyperparams, metric_logger=cw_metrics)
+
+    # CREATE MODEL METADATA
+    model_desc = {
+        "description": "SASRec model",
+        "n_days": hyperparams.n_days,
+        "user_count_threshold": hyperparams.user_count_threshold,
+        "num_epochs": hyperparams.num_epochs,
+        "hidden_units": hyperparams.hidden_units,
+        "batch_size": hyperparams.batch_size,
+        "learning_rate": hyperparams.learning_rate,
+        "l2_emb": hyperparams.l2_emb,
+        "maxlen": hyperparams.maxlen,
+        "num_blocks": hyperparams.num_blocks,
+        "evaluate_model" : hyperparams.evaluate_model
+    }
+
+    if hyperparams.evaluate_model:
+
+        import mlflow
+        from pa_base.train.model_evaluation import MLmetricsLogger
+        ml_metric_logger = MLmetricsLogger(model_name=hyperparams.model_variant_name)
+
+        #Log the hyperparams used for Sasrec within the mlflow
+        mlflow.log_param("n_days", hyperparams.n_days)
+        mlflow.log_param("user_count_threshold", hyperparams.user_count_threshold)
+        mlflow.log_param("num_epochs", hyperparams.num_epochs)
+        mlflow.log_param("hidden_units", hyperparams.hidden_units)
+        mlflow.log_param("batch_size", hyperparams.batch_size)
+        mlflow.log_param("learning_rate", hyperparams.learning_rate)
+        mlflow.log_param("l2_emb", hyperparams.l2_emb)
+        mlflow.log_param("maxlen", hyperparams.maxlen)
+        mlflow.log_param("num_blocks", hyperparams.num_blocks)
+        mlflow.log_param("dropout_rate",hyperparams.dropout_rate)
+        mlflow.log_param("num_heads", hyperparams.num_heads)
+        mlflow.log_param("loss_function", hyperparams.loss_function)
+        mlflow.log_param("calibration_gbce", hyperparams.calibration_gbce)
+        mlflow.log_param("num_batch_negatives", hyperparams.num_batch_negatives)
+        mlflow.log_param("num_uniform_negatives", hyperparams.num_uniform_negatives)
+        mlflow.log_param("top_k_negatives", hyperparams.hpt_top_k_negatives)
+
+        train_data, sasrec_model_meta_data, test_data, itemid_for_extid, external_ids_count_values = data_split(data, model_desc, ml_metric_logger, hyperparams.data_split_type, hyperparams.test_size)
+
+        model = train_model(site=site, data=train_data, hyperparams=hyperparams,
+                            ml_metric_logger=ml_metric_logger, metric_logger=cw_metrics)
+
+        logging.info("Training finished")
+
+        dump_meta_data_model(model, sasrec_model_meta_data, model_dir)
+        logging.info("Meta data, model and weights saved")
+ 
+
+        offline_metric_values, total_test_duration  = offline_evaluation( test_data.user_data, external_ids_count_values, itemid_for_extid, hyperparams=hyperparams,  ml_metric_logger = ml_metric_logger)
+
+        logging.info(" New Model evaluation done")
+
+        for metric_name, metric_value in offline_metric_values.items():
+            if metric_name == "ndcg_at_n":
+                logging.info(f"ndcg_at_{hyperparams.top_nitems} is {metric_value:.4f}")
+            
+            elif metric_name == "hit_at_n":
+                logging.info(f"hit_at_{hyperparams.top_nitems} is {metric_value:.4f}")
+            
+            else:
+                logging.info(f"{metric_name} is {metric_value:.4f}")
+
+        logging.info(f"Total test duration for evaluation is  {total_test_duration:.4f}")
+
+    else:
+        #Model training without evluation for metric values
+        train_data, sasrec_model_meta_data, itemid_for_extid = prepare_data_for_training(data, model_desc)
+        logging.info("Data preparation done for model training")
+
+        model = train_model(site=site, data = train_data,
+            hyperparams=hyperparams, metric_logger=cw_metrics)
+
+        logging.info("Training finished")
+
+        dump_meta_data_model(model, sasrec_model_meta_data, model_dir)
+        logging.info("Meta data, model and weights saved")
+
+    cw_metrics.model_training_complete()
+    
+if __name__ == "__main__":
+    reconfigure_logging(file=f"{__file__}.log", loglevel="INFO")
+
+    main(site=SITE, hyperparams=HP)
+
+    # A zero exit code causes the job to be marked as Succeeded.
+    sys.exit(0)

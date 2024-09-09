@@ -1,0 +1,112 @@
+# Copyright (c) 2024, ZDF.
+#!/usr/bin/env python
+# This is a an entrypoint script for SageMaker processing jobs.
+# It launches the individual processing job based upon hyperparameter settings.
+#
+
+import argparse
+import dataclasses
+import os
+import sys
+import logging
+
+import pandas as pd
+
+from sasrec_common import preprocess
+from hyperparams import Hyperparams
+from pa_base.logging import reconfigure_logging
+from pa_base.train.cloud_watch_metrics import CloudWatchMetrics
+
+# This algorithm has a single channel of input data called 'training'. Since we run in
+# File mode, any input files are copied to the directory specified here.
+SM_CHANNEL_NAME = "training"
+
+# default SageMaker container prefix
+SM_PATH_PREFIX = '/opt/ml/'
+
+# read SITE (our target environment such as "dev", "int", "prod", ...)
+SITE = os.environ.get("SITE")
+if not SITE:
+    logging.error('You must specify the "SITE" hyperparameter!')
+    logging.error('Exiting')
+    sys.exit(255)
+
+
+def main(
+    *,
+    site: str,
+    hyperparams: Hyperparams,
+):
+    # log to CloudWatch Metrics
+    cw_metrics = CloudWatchMetrics(model_name=hyperparams.model_variant_name, enabled=hyperparams.log_cloud_watch)
+
+    # CREATE OUTPUT DIR
+    # this is the path where sagemaker injects the model into the container
+    processing_dir = os.path.join(SM_PATH_PREFIX, 'processing')
+    # create output path from which final model.tar.gz will be created
+    # pathlib.Path(model_dir).mkdir(parents=True, exist_ok=True)
+    os.makedirs(processing_dir, exist_ok=True)
+
+    # PREPROCESS DATA
+    data: pd.DataFrame = preprocess(site=site, hyperparams=hp, metric_logger=cw_metrics)
+
+    # DUMP DATA TO DISK
+    dataset_dir = os.path.join(processing_dir, "preprocessed", "data.parquet")
+    logging.info(f"Writing data to '{dataset_dir}' for training.")
+    data.to_parquet(path=dataset_dir)
+
+    # TODO CHECK FOR SUCCESSFUL PREPROCESSING
+    # if not os.path.exists(dataset_dir):
+    #     raise FileNotFoundError(f"Parquet file at '{dataset_dir}' does not exist.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    # get hyperparams directly from a JSON with a format corresponding to the Hyperparams dataclass
+    parser.add_argument(
+        "--params_json",
+        nargs="?",
+        type=str,
+        help="hyperparams as JSON-String to be used during training."
+    )
+    parser.add_argument(
+        "--loglevel",
+        nargs="?",
+        default="INFO",
+        choices=["INFO", "DEBUG", "WARNING", "ERROR"],
+        help="Log level.",
+    )
+
+    known_args, unknown_args = parser.parse_known_args()
+    if any(unknown_args):
+        logging.warning(f"Unknown arguments: '{unknown_args}'.")
+    reconfigure_logging(file=f"{__file__}.log", loglevel="INFO")
+
+    hp: Hyperparams
+    if known_args.params_json:
+        hp = Hyperparams.from_json(json_str=known_args.params_json)
+    elif "model_variant_name" in os.environ:
+        # args are passed as env vars in SageMaker
+        model_hyperparam_names = [
+            field.name for field in dataclasses.fields(Hyperparams)
+        ]
+        logging.info(
+            f"No options passed, falling back to env vars: {model_hyperparam_names}"
+        )
+        model_hyperparams = {
+            k: os.getenv(k) for k in model_hyperparam_names if k in os.environ
+        }
+        hp = Hyperparams.from_json(**model_hyperparams)
+    else:
+        logging.error(
+            "either --params_json or environment variables model_variant_name etc. required"
+        )
+        sys.exit(1)
+
+    logging.info("----- Hyperparameters -----")
+    logging.info(hp)
+
+    main(site=SITE, hyperparams=hp)
+
+    # A zero exit code causes the job to be marked a Succeeded.
+    sys.exit(0)
