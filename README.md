@@ -1,6 +1,6 @@
 # SASRec model
 This repository contains adaptations to the ["Self-Attentive Sequential Recommendation" (Kang et al. 2018]( https://doi.org/10.48550/arXiv.1808.09781)
-(SASRec)model  for personalized recommendations on the ZDF-Mediathek (more information [here](https://algorithmen.zdf.de/awf/dkdi/model-card) and [here](https://algorithmen.zdf.de/awf/dkdi)), by modifying loss function and sampling strategies:
+(SASRec)model  for personalized recommendations on the ZDF-Mediathek (more information [here](https://algorithmen.zdf.de/modelcards/modelcard-1) and [here](https://algorithmen.zdf.de/awf/dkdi)), by modifying loss function and sampling strategies:
 
 * [TRON negative sampling and loss function (Wilm et.al  2023)](https://doi.org/10.1145/3604915.3610236)
 * [gbce loss function (Petrov et al. 2023)](https://doi.org/10.48550/arXiv.2308.07192)
